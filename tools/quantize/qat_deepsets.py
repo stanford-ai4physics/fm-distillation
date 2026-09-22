@@ -1,0 +1,200 @@
+"""Quantization-aware training (QAT) for the DeepSets top-tagging student.
+
+Warm-starts from an existing float DeepSets checkpoint (already trained via
+KD from a PET2 teacher), replaces its nn.Linear layers with Brevitas
+QuantLinear (weight + input-activation quantization at a chosen bit width),
+then fine-tunes for a short schedule -- preserving the SAME distillation
+recipe (alpha/beta/T against the same precomputed teacher logits) the base
+checkpoint was trained with, so quantization is the only new variable.
+
+Deliberately standalone: does NOT edit network.py/train.py/cli.py/utils.py.
+It only *imports* from them (DeepSets, train_model, load_data, etc.) and
+does the Brevitas wrapping itself, with the `brevitas` import kept inside
+this file so importing the shared `omnilearned` package elsewhere (e.g. the
+omnilearned-clean env used by ongoing training jobs, which doesn't have
+Brevitas installed) is completely unaffected.
+
+Must be run with the omnilearned-fpga/env python (has Brevitas/QONNX/hls4ml;
+omnilearned-clean/env does not).
+
+Usage:
+    /global/homes/t/twamorka/omnilearned-fpga/env/bin/python qat_deepsets.py \
+        --tag distill_top_deepsets_distillnet_scratch_a05_T4 \
+        --size distillnet --bits 8 \
+        --save-tag qat_top_deepsets_distillnet_a05_T4_8bit \
+        --epochs 15 --lr 5e-5
+
+For a checkpoint trained with the optional message-passing block, pass the
+SAME --num-interaction-layers / --interaction-k the float run used so the
+architecture (and its state_dict keys) match before restore, e.g.:
+    ... --tag distill_top_deepsets_distillnet_scratch_a05_T4_gnn1_k64 \
+        --num-interaction-layers 1 --interaction-k 64
+"""
+
+import argparse
+import os
+
+import torch
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from diffusers.optimization import get_cosine_schedule_with_warmup
+from pytorch_optimizer import Lion
+
+from omnilearned.dataloader import load_data
+from omnilearned.network import DeepSets, ACT_LAYERS
+from omnilearned.train import train_model
+from omnilearned.utils import (
+    ddp_setup,
+    get_checkpoint_name,
+    get_deepsets_parameters,
+    get_param_groups,
+    is_master_node,
+    restore_checkpoint,
+)
+
+CHECKPOINT_DIR = "/pscratch/sd/t/twamorka/omnilearned/checkpoints/"
+DATA_PATH = "/global/cfs/cdirs/m4567/www/"
+TEACHER_DIR_L = "/pscratch/sd/t/twamorka/omnilearned/teacher_logits/companion_fine_tune_top_l"
+
+
+def wrap_linears_qat(model, weight_bits, act_bits):
+    """Replace every nn.Linear in `model` with a Brevitas QuantLinear in
+    place, copying over the existing (already-trained) weight/bias so this
+    is a warm start, not a random re-init. Submodule names/paths are
+    preserved exactly (setattr on the same parent, same child_name), so
+    everything downstream that walks named_parameters() by path --
+    no_weight_decay() matching, get_param_groups()'s "body.embed"/"norm"
+    name checks, save_checkpoint's model.module.body.state_dict() -- keeps
+    working unmodified."""
+    import brevitas.nn as qnn
+    from brevitas.quant.scaled_int import Int8ActPerTensorFloat, Int8WeightPerTensorFloat
+
+    targets = []
+    for module in model.modules():
+        for child_name, child in module.named_children():
+            if isinstance(child, nn.Linear):
+                targets.append((module, child_name, child))
+
+    for module, child_name, child in targets:
+        qlin = qnn.QuantLinear(
+            child.in_features,
+            child.out_features,
+            bias=child.bias is not None,
+            weight_quant=Int8WeightPerTensorFloat,
+            weight_bit_width=weight_bits,
+            input_quant=Int8ActPerTensorFloat,
+            input_bit_width=act_bits,
+            return_quant_tensor=False,
+        )
+        qlin.weight.data.copy_(child.weight.data)
+        if child.bias is not None:
+            qlin.bias.data.copy_(child.bias.data)
+        setattr(module, child_name, qlin)
+
+    return model
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tag", required=True, help="base float checkpoint tag to warm-start from")
+    ap.add_argument("--size", required=True, help="e.g. small, distillnet, tiny, micro, nano")
+    ap.add_argument("--save-tag", required=True, help="new tag for the QAT checkpoint")
+    ap.add_argument("--bits", type=int, default=8)
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--warmup-epoch", type=float, default=1.0)
+    ap.add_argument("--lr", type=float, default=5e-5)
+    ap.add_argument("--wd", type=float, default=0.5)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--iterations", type=int, default=1000)
+    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--teacher-dir", default=TEACHER_DIR_L)
+    ap.add_argument("--teacher-tag", default="fine_tune_top_l")
+    ap.add_argument("--distill-alpha", type=float, default=0.5)
+    ap.add_argument("--distill-beta", type=float, default=0.5)
+    ap.add_argument("--distill-t", type=float, default=4.0)
+    ap.add_argument("--num-interaction-layers", type=int, default=0,
+                    help="must match the float checkpoint's message-passing depth")
+    ap.add_argument("--interaction-k", type=int, default=0,
+                    help="must match the float checkpoint's leading-pT constituent cap")
+    ap.add_argument("--act-layer", default="gelu", choices=sorted(ACT_LAYERS),
+                    help="must match the float checkpoint's activation")
+    ap.add_argument("--deepsets-fixed-n", type=int, default=0,
+                    help="must match the float checkpoint's fixed-N/no-mask body (0 = masked-mean)")
+    args = ap.parse_args()
+
+    local_rank, rank, size = ddp_setup()
+
+    ds_params = get_deepsets_parameters(args.size)
+    model = DeepSets(
+        input_dim=4, num_classes=2, mode="classifier",
+        num_interaction_layers=args.num_interaction_layers,
+        interaction_k=args.interaction_k,
+        act_layer=ACT_LAYERS[args.act_layer],
+        fixed_n=args.deepsets_fixed_n,
+        **ds_params,
+    )
+    restore_checkpoint(
+        model, CHECKPOINT_DIR, get_checkpoint_name(args.tag), local_rank, is_main_node=is_master_node()
+    )
+    n_params = sum(p.numel() for p in model.parameters())
+    if is_master_node():
+        print(f"Warm-started from {args.tag} ({args.size}): {n_params:,} params")
+
+    wrap_linears_qat(model, weight_bits=args.bits, act_bits=args.bits)
+    if is_master_node():
+        n_qlin = sum(1 for m in model.modules() if type(m).__name__ == "QuantLinear")
+        print(f"Wrapped {n_qlin} nn.Linear layers as Brevitas QuantLinear ({args.bits}-bit)")
+
+    train_loader = load_data(
+        "top", dataset_type="train", use_cond=True, path=DATA_PATH, batch=args.batch,
+        num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
+        teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
+    )
+    val_loader = load_data(
+        "top", dataset_type="val", use_cond=True, path=DATA_PATH, batch=args.batch,
+        num_workers=args.num_workers, rank=rank, size=size, mode="classifier",
+        teacher_labels_dir=args.teacher_dir, teacher_tag=args.teacher_tag,
+    )
+
+    param_groups = get_param_groups(model, args.wd, args.lr, lr_factor=1.0, fine_tune=False)
+    optimizer = Lion(param_groups, betas=(0.95, 0.98))
+
+    train_steps = args.iterations if args.iterations > 0 else len(train_loader)
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=int(train_steps * args.warmup_epoch),
+        num_training_steps=train_steps * args.epochs,
+    )
+
+    kwarg = {}
+    if torch.cuda.is_available():
+        device = local_rank
+        model.to(local_rank)
+        kwarg["device_ids"] = [device]
+    else:
+        model.cpu()
+        device = "cpu"
+    model = DDP(model, **kwarg)
+
+    train_model(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        lr_scheduler,
+        mode="classifier",
+        num_epochs=args.epochs,
+        device=device,
+        output_dir=CHECKPOINT_DIR,
+        save_tag=args.save_tag,
+        iterations_per_epoch=train_steps,
+        ema_model=None,
+        distill=True,
+        distill_alpha=args.distill_alpha,
+        distill_beta=args.distill_beta,
+        distill_T=args.distill_t,
+    )
+
+
+if __name__ == "__main__":
+    main()
